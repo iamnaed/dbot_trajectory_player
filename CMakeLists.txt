@@ -12,7 +12,10 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
 
-# add library
+find_package(moveit REQUIRED)
+find_package(moveit_ros_planning_interface REQUIRED)
+
+# add library for server
 add_library(
   dbot_trajectory_server
   SHARED
@@ -36,6 +39,8 @@ ament_target_dependencies(
   "rclcpp"
   "rclcpp_action"
   "rclcpp_components"
+  "moveit"
+  "moveit_ros_planning_interface"
 )
 
 rclcpp_components_register_node(
@@ -48,6 +53,49 @@ rclcpp_components_register_node(
 
 install(TARGETS
   dbot_trajectory_server
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+# add library for client
+add_library(
+  dbot_trajectory_client
+  SHARED
+  src/dbot_trajectory_client.cpp
+)
+target_include_directories(
+  dbot_trajectory_client
+  PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_compile_definitions(
+  dbot_trajectory_client
+  PRIVATE
+  "DBOT_TRAJECTORY_PLAYER_CPP_BUILDING_DLL"
+)
+
+ament_target_dependencies(
+  dbot_trajectory_client
+  "dbot_interfaces"
+  "rclcpp"
+  "rclcpp_action"
+  "rclcpp_components"
+  "moveit"
+  "moveit_ros_planning_interface"
+)
+
+rclcpp_components_register_node(
+  dbot_trajectory_client 
+  PLUGIN 
+  "dbot_trajectory_player::DbotTrajectoryActionClient" 
+  EXECUTABLE 
+  dbot_trajectory_action_client
+)
+
+install(TARGETS
+  dbot_trajectory_client
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
