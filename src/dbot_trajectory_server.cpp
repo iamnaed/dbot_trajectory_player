@@ -291,6 +291,13 @@ private:
         };
 
         // Result callback
+        send_goal_options.feedback_callback = [LOGGER](GoalHandleMoveGroupSequence::SharedPtr ptr, const std::shared_ptr<const MoveGroupSequence::Feedback> feedback) 
+        {
+            (void)ptr;
+            RCLCPP_INFO(LOGGER, "Feedback state:%s",(feedback->state).c_str());
+        };
+
+        // Result callback
         send_goal_options.result_callback = [LOGGER](const GoalHandleMoveGroupSequence::WrappedResult& result) 
         {
             switch (result.code)
