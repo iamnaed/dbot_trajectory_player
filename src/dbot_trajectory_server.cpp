@@ -4,17 +4,30 @@
 #include <string>
 #include <vector>
 
-#include <dbot_interfaces/action/dbot_trajectory.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
+
+#include <dbot_interfaces/action/dbot_trajectory.hpp>
 #include <dbot_trajectory_player/visibility_control.h>
+#include <dbot_trajectory_player/job.hpp>
+
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/robot_model/robot_model.h>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit_msgs/msg/motion_sequence_item.hpp>
+#include <moveit_msgs/msg/motion_sequence_request.hpp>
+#include <moveit_msgs/msg/planning_options.hpp>
+#include <moveit_msgs/srv/get_motion_sequence.hpp>
+#include <moveit_msgs/action/move_group_sequence.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
-
-
+#include <moveit/kinematic_constraints/utils.h>
 
 namespace dbot_trajectory_player
 {
+
+using moveit_msgs::action::MoveGroupSequence;
+using GoalHandleMoveGroupSequence = rclcpp_action::ClientGoalHandle<MoveGroupSequence>;
 
 class DbotTrajectoryActionServer : public rclcpp::Node
 {
@@ -25,6 +38,7 @@ public:
     DBOT_TRAJECTORY_PLAYER_CPP_PUBLIC
     explicit DbotTrajectoryActionServer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("dbot_trajectory_action_server_node", options)
     {
+        // Dbot Trajectory Action Server
         using namespace std::placeholders;
         this->action_server_ = rclcpp_action::create_server<DbotTrajectory>(
             this, 
@@ -35,6 +49,9 @@ public:
         );
 
         RCLCPP_INFO(this->get_logger(), "Action server running: dbot_trajectory_action");
+
+        // Move Group Sequence Action Client
+        move_group_seq_client_ = rclcpp_action::create_client<MoveGroupSequence>(this, "/sequence_move_group");
     }
 
 private:
@@ -47,22 +64,29 @@ private:
     /**
      * @brief 
      * 
+     */
+    rclcpp_action::Client<MoveGroupSequence>::SharedPtr move_group_seq_client_;    
+
+    /**
+     * @brief 
+     * 
      * @param uuid 
      * @param goal 
      * @return rclcpp_action::GoalResponse 
      */
     rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID& uuid, std::shared_ptr<const DbotTrajectory::Goal> goal)
     {
-        RCLCPP_INFO(this->get_logger(), "Received goal request with job '%s'", goal->job.c_str());
+        RCLCPP_INFO(this->get_logger(), "Received goal request with job: \n'%s'", goal->job.c_str());
         (void)uuid;
         
         // Guard
-        if(!is_valid_job(goal->job))
+        if(!Job::is_valid(goal->job))
         {
             RCLCPP_INFO(this->get_logger(), "Invalid job format. Rejecting request. . .");
             return rclcpp_action::GoalResponse::REJECT;
         }
 
+        RCLCPP_INFO(this->get_logger(), "Received goal request accepted and will be executed");
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
@@ -104,444 +128,234 @@ private:
         auto result = std::make_shared<DbotTrajectory::Result>();
         rclcpp::Rate loop_rate(1);
         RCLCPP_INFO(this->get_logger(), "Goal: %s", goal->job.c_str());
-
-        //parse(goal->job);
         
+        // Parse
         RCLCPP_INFO(this->get_logger(), "Parsing job");
-        auto job = goal->job;
-        auto name = get_name(job);
-        auto positions = get_positions(job);
-        auto proglines = get_proglines(job);
-        auto len = proglines.size();
-        RCLCPP_INFO(this->get_logger(), "Dbot running program: %s", name.c_str());
-        RCLCPP_INFO(this->get_logger(), "Positions: %li", positions.size());
-        RCLCPP_INFO(this->get_logger(), "Proglines: %li", proglines.size());
+        auto jobstring = goal->job;
+        Job job = Job::create(jobstring, this->get_logger());
+        RCLCPP_INFO(this->get_logger(), "Parsing succeded");
+        RCLCPP_INFO(this->get_logger(), "Dbot running program: %s", job.get_name().c_str());
+        //RCLCPP_INFO(this->get_logger(), "Positions: %li", positions.size());
+        //RCLCPP_INFO(this->get_logger(), "Proglines: %li", proglines.size());
 
+        // Robot Model
+        robot_model_loader::RobotModelLoader robot_model_loader(this->shared_from_this());
+        const moveit::core::RobotModelPtr& kinematic_model = robot_model_loader.getModel();
+        RCLCPP_INFO(this->get_logger(), "Model frame: %s", kinematic_model->getModelFrame().c_str());
+
+        // Create a MotionSequenceRequest
+        moveit_msgs::msg::MotionSequenceRequest sequence_request;
+        std::vector<Command> commands = job.get_commands();
+        RCLCPP_INFO(this->get_logger(), "Found %li commands\n", commands.size());
+        auto len = commands.size();
         for (size_t i = 0; i < len; i++)
         {
             // Check if there is a cancel request
-            if (goal_handle->is_canceling()) {
-                result->success = false;
-                goal_handle->canceled(result);
-                RCLCPP_INFO(this->get_logger(), "Goal canceled");
-                return;
-            }
+            // if (goal_handle->is_canceling()) {
+            //     result->success = false;
+            //     goal_handle->canceled(result);
+            //     RCLCPP_INFO(this->get_logger(), "Goal canceled");
+            //     return;
+            // }
 
             // Data
-            auto line = proglines.at(i);
-            auto line_trimmed = trim(line);
-            auto tkns = get_line_tokens(line_trimmed);
-            RCLCPP_INFO(this->get_logger(), "Parsing line: %s", line_trimmed.c_str());
+            Command cmd = commands.at(i);
+            // ----- Motion Sequence Item
+            // Create a MotionSequenceItem
+            moveit_msgs::msg::MotionSequenceItem item;
 
-            // Command
-            auto cmd = tkns.at(0);
-            auto cmd_t = trim(cmd);
-            
+            // Set pose blend radius
+            //double br = (i==0 || i==len-1) ? 0.0 : 0.1*M_PI/180;
+            item.blend_radius = 0;
+            RCLCPP_INFO(this->get_logger(), "Command:%li Blend Radius: %lf",i,item.blend_radius);
+
             // PTP | JOINT
-            if(cmd_t == "PTP")
+            if(cmd.move_type == MoveType::Ptp)
             {
-                // PTP 0000 100.0
-                int pos = std::stoi(tkns.at(1));
-                double speed = std::stod(tkns.at(2));
-                std::vector<double> target = positions[pos];
-
-                RCLCPP_INFO(this->get_logger(), "Running PTP. Speed:%f",speed);
-                RCLCPP_INFO(this->get_logger(), "Joint target");
+                RCLCPP_INFO(this->get_logger(), "Move Type: PTP");
+                // PTP 100.0 [20.0,10.0,00.0,0.0,0.0,0.0]
+                double speed = cmd.speed / 100.0;
+                std::array<double, 6> target = cmd.position;
+                std::vector<double> joint_values;
                 for (size_t i = 0; i < target.size(); i++)
                 {
-                    RCLCPP_INFO(this->get_logger(), "\tj%li : %f", i, target.at(i));
+                    double rad = target[i] * M_PI / 180.0;
+                    joint_values.push_back(rad);
                 }
                 
-                // Publish feedback
-                std::array<double, 6> targetarr;
-                for (size_t i = 0; i < 6; i++)
-                {
-                    targetarr.at(i) = target.at(i);
-                }
-                feedback->joints = targetarr;
-                goal_handle->publish_feedback(feedback);
-                RCLCPP_INFO(this->get_logger(), "Published feedback");
+                // MotionSequenceItem configuration
+                item.req.group_name = "dbot_arm";
+                item.req.planner_id = "PTP";
+                item.req.allowed_planning_time = 5.0;
+                item.req.max_velocity_scaling_factor = speed;
+                item.req.max_acceleration_scaling_factor = 1;
 
-                loop_rate.sleep();
+                // Using the :moveit_codedir:`RobotModel<moveit_core/robot_model/include/moveit/robot_model/robot_model.h>`, we can
+                // construct a :moveit_codedir:`RobotState<moveit_core/robot_state/include/moveit/robot_state/robot_state.h>` that
+                // maintains the configuration of the robot. We will set all joints in the state to their default values. We can then
+                // get a :moveit_codedir:`JointModelGroup<moveit_core/robot_model/include/moveit/robot_model/joint_model_group.h>`,
+                // which represents the robot model for a particular group, e.g. the "panda_arm" of the Panda robot.
+                // Robot State
+                moveit::core::RobotState robot_state(kinematic_model);
+                const moveit::core::JointModelGroup* joint_model_group = kinematic_model->getJointModelGroup("dbot_arm");
+                robot_state.setJointGroupPositions(joint_model_group, joint_values);                
+                auto constraints = kinematic_constraints::constructGoalConstraints(robot_state,joint_model_group);
+                item.req.goal_constraints.push_back(constraints);
+
+                // Add to Motion Sequence
+                RCLCPP_INFO(this->get_logger(), "Adding Cmd: PTP, Speed:%lf, Pos:[%lf,%lf,%lf,%lf,%lf,%lf,]", 
+                                                speed,
+                                                joint_values[0],joint_values[1],joint_values[2],
+                                                joint_values[3],joint_values[4],joint_values[5]);
+                sequence_request.items.push_back(item);
             }
 
             // LINEAR
-            else if(cmd_t == "LIN")
+            else if(cmd.move_type == MoveType::Lin)
             {
+                // RCLCPP_INFO(this->get_logger(), "Move Type: PTP");
+                // // PTP 0000 100.0
+                // double speed = cmd.speed;
+                // std::array<double, 6> target = cmd.position;
+                // std::vector<double> joint_values;
 
+                // // ----- Motion Sequence Item
+                // // Create a MotionSequenceItem
+                // moveit_msgs::msg::MotionSequenceItem item1;
+
+                // // Set pose blend radius
+                // item1.blend_radius = 0.1;
+
+                // // MotionSequenceItem configuration
+                // item1.req.group_name = "dbot_arm";
+                // item1.req.planner_id = "LIN";
+                // item1.req.allowed_planning_time = 5.0;
+                // item1.req.max_velocity_scaling_factor = 0.1;
+                // item1.req.max_acceleration_scaling_factor = 0.1;
+
+                // moveit_msgs::msg::Constraints constraints_item1;
+                // moveit_msgs::msg::PositionConstraint pos_constraint_item1;
+                // pos_constraint_item1.header.frame_id = "world";
+                // pos_constraint_item1.link_name = "panda_hand";
+
+                // // Set a constraint pose
+                // auto target_pose_item1 = [target] {
+                //     geometry_msgs::msg::PoseStamped msg;
+                //     msg.header.frame_id = "base_link";
+                //     msg.pose.position.x = target[0];
+                //     msg.pose.position.y = target[1];
+                //     msg.pose.position.z = target[2];
+                //     // msg.pose.orientation.x = target[0];
+                //     // msg.pose.orientation.y = target[0];
+                //     // msg.pose.orientation.z = target[0];
+                //     // msg.pose.orientation.w = target[0];
+                //     return msg;
+                // }();
+                // item1.req.goal_constraints.push_back(
+                //     kinematic_constraints::constructGoalConstraints("tcp_link", target_pose_item1));
             }
+
+        }
+
+        // Verify that the action server is up and running
+        if (!move_group_seq_client_->wait_for_action_server(std::chrono::seconds(10)))
+        {
+            RCLCPP_ERROR(this->get_logger(), "Error waiting for action server /sequence_move_group");
+            return;
+        }
+
+        // Create action goal
+        auto goal_msg = MoveGroupSequence::Goal();
+        goal_msg.request = sequence_request;
+
+        // Goal response callback
+        auto LOGGER = this->get_logger();
+        auto send_goal_options = rclcpp_action::Client<MoveGroupSequence>::SendGoalOptions();
+        send_goal_options.goal_response_callback = [LOGGER](std::shared_ptr<GoalHandleMoveGroupSequence> goal_handle) 
+        {
+            try
+            {
+                if (!goal_handle)
+                {
+                    RCLCPP_ERROR(LOGGER, "Goal was rejected by server");
+                }
+                else
+                {
+                    RCLCPP_INFO(LOGGER, "Goal accepted by server, waiting for result");
+                }
+            }
+            catch (const std::exception& e)
+            {
+                RCLCPP_ERROR(LOGGER, "Exception while waiting for goal response: %s", e.what());
+            }
+        };
+
+        // Result callback
+        send_goal_options.result_callback = [LOGGER](const GoalHandleMoveGroupSequence::WrappedResult& result) 
+        {
+            switch (result.code)
+            {
+            case rclcpp_action::ResultCode::SUCCEEDED:
+                RCLCPP_INFO(LOGGER, "Move Group trajectory plan succeeded");
+                break;
+            case rclcpp_action::ResultCode::ABORTED:
+                RCLCPP_ERROR(LOGGER, "Goal was aborted. Status: %d", result.result->response.error_code.val);
+                break;
+            case rclcpp_action::ResultCode::CANCELED:
+                RCLCPP_ERROR(LOGGER, "Goal was canceled");
+                break;
+            default:
+                RCLCPP_ERROR(LOGGER, "Unknown result code");
+                break;
+            }
+            RCLCPP_INFO(LOGGER, "Result received");
+        };
+
+        // Send the action goal
+        auto goal_handle_future = move_group_seq_client_->async_send_goal(goal_msg, send_goal_options);
+
+        // Get result
+        auto action_result_future = move_group_seq_client_->async_get_result(goal_handle_future.get());
+
+        // Wait for the result
+        std::future_status action_status;
+        do
+        {
+            switch (action_status = action_result_future.wait_for(std::chrono::seconds(1)); action_status)
+            {
+            case std::future_status::deferred:
+                RCLCPP_ERROR(LOGGER, "Deferred");
+                break;
+            case std::future_status::timeout:
+                RCLCPP_INFO(LOGGER, "Trajectory is executing...");
+                break;
+            case std::future_status::ready:
+                RCLCPP_INFO(LOGGER, "Trajectory ready!");
+                break;
+            }
+        } while (action_status != std::future_status::ready);
+
+        if (action_result_future.valid())
+        {
+            auto result = action_result_future.get();
+            RCLCPP_INFO(LOGGER, "Action completed. Result: %d", static_cast<int>(result.code));
+        }
+        else
+        {
+            RCLCPP_ERROR(LOGGER, "Action couldn't be completed.");
         }
 
         // Check if goal is done
+        auto serv_res = std::make_shared<DbotTrajectory::Result>();
         if (rclcpp::ok()) {
-            result->success = true;
-            goal_handle->succeed(result);
-            RCLCPP_INFO(this->get_logger(), "Goal succeeded");
+            serv_res->success = true;
+            goal_handle->succeed(serv_res);
+            RCLCPP_INFO(LOGGER, "Goal succeeded");
         }
-    }
 
-    /**
-     * @brief Get the name object
-     * 
-     * @param job 
-     * @return std::string 
-     */
-    std::string get_name(const std::string& job)
-    {
-        std::string name;
-        auto joblines = get_joblines(job);
-        for (size_t i = 0; i < joblines.size(); i++)
-        {
-            auto line = joblines.at(i);
-            auto line_trimmed = trim(line);
-            auto tkns = get_tokens(job, ' ');
-            if(line_trimmed.rfind("NAME") == 0)
-            {
-                name = tkns.at(1);
-                break;
-            }
-        }
-        return name;
     }
     
-    /**
-     * @brief Get the tokens object
-     * 
-     * @param line 
-     * @param split 
-     * @return std::vector<std::string> 
-     */
-    std::vector<std::string> get_tokens(const std::string& line, const char& split)
-    {
-        std::vector<std::string> tokens;
-        std::stringstream ss(line);
-        std::string token;
-        while(std::getline(ss, token, split))
-        {
-            tokens.push_back(token);
-        }
-
-        return tokens;
-    }
-    
-    /**
-     * @brief Get the proglines object
-     * 
-     * @param job 
-     * @return std::vector<std::string> 
-     */
-    std::vector<std::string> get_proglines(const std::string& job)
-    {
-        std::vector<std::string> proglines;
-        auto joblines = get_joblines(job);
-        bool is_prog_line = false;
-        for (size_t i = 0; i < joblines.size(); i++)
-        {
-            auto line = joblines.at(i);
-            auto line_trimmed = trim(line);
-            auto tkns = get_tokens(job, ' ');
-
-            // Program End
-            if(line_trimmed.rfind("PROG_END") == 0)
-            {
-                is_prog_line = false;
-                break;
-            }
-
-            // Program Start
-            if(line_trimmed.rfind("PROG_START") == 0)
-            {
-                is_prog_line = true;
-                continue; // Skip a line
-            }
-
-            // Add line
-            if(is_prog_line)
-            {
-                proglines.push_back(line_trimmed);
-            }
-        }
-        return proglines;
-    }
-
-    /**
-     * @brief 
-     * 
-     * @param job 
-     */
-    std::vector<std::string> get_joblines(const std::string& job)
-    {
-        std::vector<std::string> tokens;
-        std::stringstream ss(job);
-        std::string token;
-        while(std::getline(ss, token, '\n'))
-        {
-            tokens.push_back(token);
-        }
-
-        return tokens;
-    }
-
-    /**
-     * @brief Get the line tokens object
-     * 
-     * @param jobline 
-     * @return std::vector<std::string> 
-     */
-    std::vector<std::string> get_line_tokens(const std::string& jobline)
-    {
-        std::vector<std::string> tokens;
-        std::stringstream ss(jobline);
-        std::string token;
-        while(std::getline(ss, token, ' '))
-        {
-            tokens.push_back(token);
-        }
-
-        return tokens;
-    }
-
-    /**
-     * @brief Get the line tokens object
-     * 
-     * @param job 
-     * @return std::vector<std::string> 
-     */
-    std::map<int, std::vector<double>> get_positions(const std::string& job)
-    {
-        std::map<int, std::vector<double>> positions;
-        auto joblines = get_joblines(job);
-        bool is_pos = false;
-        for (size_t i = 0; i < joblines.size(); i++)
-        {
-            auto line = joblines.at(i);
-            auto line_trimmed = trim(line);
-            auto tkns = get_line_tokens(line_trimmed);
-            
-            if(line_trimmed == "POS_START")
-            {
-                is_pos = true;
-            }
-            else if(line_trimmed == "POS_END")
-            {
-                is_pos = false;
-                break;
-            }
-
-            if(is_pos)
-            {
-                // 0002 = 20,-10,-30,45,-10,10
-                if(line_trimmed.find("=") != std::string::npos)
-                {
-                    int idx = get_index(line_trimmed);
-                    std::vector<double> joints = get_joints(line_trimmed);
-                    positions[idx] = joints;
-                }
-            }            
-        }
-
-        return positions;
-    }
-
-    /**
-     * @brief Get the index object
-     * 
-     * @param jointline 
-     * @return int 
-     */
-    int get_index(const std::string& jointline)
-    {
-        auto sub_idx = jointline.substr(0,jointline.find("="));
-        int idx = std::stoi(sub_idx);
-        return idx;
-    }
-
-    /**
-     * @brief Get the joints object
-     * 
-     * @param jointline 
-     * @return std::vector<double> 
-     */
-    std::vector<double> get_joints(const std::string& jointline)
-    {
-        std::vector<double> joints;
-        auto sub_values = jointline.substr(jointline.find("=")+1);
-        auto tokens = get_tokens(jointline, ',');
-        for (size_t i = 0; i < 6; i++)
-        {
-             double j = std::stod(tokens.at(i));
-             joints.push_back(j);
-        }
-        
-        return joints;
-    }
-
-    /**
-     * @brief 
-     * 
-     * @param job 
-     */
-    void parse(const std::string& job)
-    {
-        // MoveGroupInterface
-        // using moveit::planning_interface::MoveGroupInterface;
-        // auto mgi = MoveGroupInterface(, "dbot_arm");
-        RCLCPP_INFO(this->get_logger(), "Parsing job");
-        rclcpp::Rate loop_rate(1);
-        auto name = get_name(job);
-        auto positions = get_positions(job);
-        auto joblines = get_joblines(job);
-        auto len = joblines.size();
-        RCLCPP_INFO(this->get_logger(), "Dbot running program: %s", name.c_str());
-        RCLCPP_INFO(this->get_logger(), "Positions: %li", positions.size());
-        RCLCPP_INFO(this->get_logger(), "Joblines: %li", joblines.size());
-
-        for (size_t i = 0; i < len; i++)
-        {
-            auto line = joblines.at(i);
-            auto line_trimmed = trim(line);
-            auto tkns = get_line_tokens(line_trimmed);
-
-            // Command
-            auto cmd = tkns.at(0);
-            auto cmd_t = trim(cmd);
-            RCLCPP_INFO(this->get_logger(), "Parsing line: %s", cmd_t.c_str());
-
-            // PTP | JOINT
-            if(cmd_t == "PTP")
-            {
-                // PTP 0000 100.0
-                int pos = std::stoi(tkns.at(1));
-                double speed = std::stod(tkns.at(2));
-                std::vector<double> target = positions[pos];
-
-                RCLCPP_INFO(this->get_logger(), "Running PTP. Speed:%f",speed);
-                RCLCPP_INFO(this->get_logger(), "Joint target");
-                for (size_t i = 0; i < target.size(); i++)
-                {
-                    RCLCPP_INFO(this->get_logger(), "\tj%li : %f", i, target.at(i));
-                }
                 
-                loop_rate.sleep();
-
-        //     // Check if there is a cancel request
-        //     if (goal_handle->is_canceling()) {
-        //         result->success = false;
-        //         goal_handle->canceled(result);
-        //         RCLCPP_INFO(this->get_logger(), "Goal canceled");
-        //         return;
-        //     }
-
-        //     // Update sequence
-        //     joints = {0.0*i,1.0*i,2.0*i,3.0*i,4.0*i,5.0*i};
-
-        //     // Publish feedback
-        //     goal_handle->publish_feedback(feedback);
-        //     RCLCPP_INFO(this->get_logger(), "Publish feedback");
-
-
-
-                // // Set a target Pose
-                // RCLCPP_INFO(this->get_logger(), "Dbot setting joint targets.");
-                // mgi.setJointValueTarget(target);
-
-                // // Display planner settings
-                // RCLCPP_INFO(this->get_logger(), "Dbot setting planner.");
-                // mgi.setPlanningPipelineId("pilz_industrial_motion_planner");
-                // mgi.setPlannerId("PTP");
-                // mgi.setMaxVelocityScalingFactor(1);
-                // mgi.setMaxAccelerationScalingFactor(1);
-
-                // const std::string& planner_id = mgi.getPlannerId();
-                // const std::string& planner_frame = mgi.getPlanningFrame();
-                // const std::string& planner_pipeline_id = mgi.getPlanningPipelineId();
-                // const double& planner_planning_time = mgi.getPlanningTime();
-                // RCLCPP_INFO(this->get_logger(), "Dbot planner_id: %s", planner_id.c_str());
-                // RCLCPP_INFO(this->get_logger(), "Dbot planner_frame: %s", planner_frame.c_str());
-                // RCLCPP_INFO(this->get_logger(), "Dbot planning_pipeline_id: %s", planner_pipeline_id.c_str());
-                // RCLCPP_INFO(this->get_logger(), "Dbot planning_time: %lf", planner_planning_time);
-
-                // // Plan
-                // RCLCPP_INFO(this->get_logger(), "Dbot attempting to create plan.");
-                // auto const [error_code, plan] = [&mgi]{
-                //     moveit::planning_interface::MoveGroupInterface::Plan pl;
-                //     auto const ok = mgi.plan(pl);
-                //     return std::make_pair(ok, pl);
-                // }();
-
-                // // Print plan
-                // //print_plan(plan);
-                
-                // // Execute
-                // if(error_code == moveit::core::MoveItErrorCode::SUCCESS){
-                //     RCLCPP_INFO(this->get_logger(), "Dbot executing plan.");
-                //     mgi.execute(plan);
-                // } else {
-                //     RCLCPP_ERROR(this->get_logger(), "Dbot planning failed.");
-                // }
-            }
-
-            // LINEAR
-            else if(line.rfind("LIN", 0) == 0)
-            {
-
-            }
-        }
-        
-    }
-
-   
-    /**
-     * @brief 
-     * 
-     * @param s 
-     * @return std::string 
-     */
-    std::string ltrim(const std::string &s)
-    {
-        const std::string WHITESPACE = " \n\r\t\f\v";
-        size_t start = s.find_first_not_of(WHITESPACE);
-        return (start == std::string::npos) ? "" : s.substr(start);
-    }
-    
-    /**
-     * @brief 
-     * 
-     * @param s 
-     * @return std::string 
-     */
-    std::string rtrim(const std::string &s)
-    {
-        const std::string WHITESPACE = " \n\r\t\f\v";
-        size_t end = s.find_last_not_of(WHITESPACE);
-        return (end == std::string::npos) ? "" : s.substr(0, end + 1);
-    }
-    
-    /**
-     * @brief 
-     * 
-     * @param s 
-     * @return std::string 
-     */
-    std::string trim(const std::string &s) {
-        return rtrim(ltrim(s));
-    }
-        
-    /**
-     * @brief 
-     * 
-     * @param job 
-     * @return true 
-     * @return false 
-     */
-    bool is_valid_job(const std::string& job)
-    {
-        (void)job;
-        return true;
-    }
-
-
-
 }; // CLASS DbotTrajectoryActionServer
 
 } // NAMESPACE dbot_trajectory_player

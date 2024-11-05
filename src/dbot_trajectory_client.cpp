@@ -26,6 +26,8 @@ public:
     explicit DbotTrajectoryActionClient(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("dbot_trajectory_action_client_node", options)
     {
         this->action_client_ = rclcpp_action::create_client<DbotTrajectory>(this, "dbot_trajectory_action");
+        
+        // Give time to start the server, if in a launch file
         this->timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&DbotTrajectoryActionClient::send_goal, this));
     }
 
@@ -46,26 +48,37 @@ public:
 
         // Send
         auto goal_msg = DbotTrajectory::Goal();
-        goal_msg.job = "NAME dbot_job \n\
-DATE 2024/02/07 16:04 \n\
-POS_START \n\
-    0000 = 0,0,0,0,0,0 \n\
-    0001 = 0,10,30,0,0,10 \n\
-    0002 = 20,-10,-30,45,-10,10 \n\
-    0003 = 0,0,0,0,0,0 \n\
-POS_END \n\
-PROG_START \n\
-    PTP 0000 100.0 \n\
-    PTP 0001 100.0 \n\
-    PTP 0002 100.0 \n\
-    PTP 0003 100.0 \n\
-PROG_END";
-        RCLCPP_INFO(this->get_logger(), "Sending goal");
+//         goal_msg.job = "NAME dbot_job \n\
+// DATE 2024/02/07 16:04 \n\
+// POS_START \n\
+//     0000 = 0,0,0,0,0,0 \n\
+//     0001 = 0,10,30,0,0,10 \n\
+//     0002 = 20,-10,-30,45,-10,10 \n\
+//     0003 = 0,0,0,0,0,0 \n\
+// POS_END \n\
+// PROG_START \n\
+//     PTP 0000 100.0 \n\
+//     PTP 0001 100.0 \n\
+//     PTP 0002 100.0 \n\
+//     PTP 0003 100.0 \n\
+// PROG_END";
+        goal_msg.job = "NAME dbot_job_v2\n\
+                        DATE 2024/02/07 16:04 \n\
+                        PROG_START \n\
+                            0 PTP 20.0 [0.0,0.0,0.0,0.0,0.0,0.0]\n\
+                            1 PTP 20.0 [50.0,10.0,30.0,-90.0,0.0,10.0]\n\
+                            2 PTP 20.0 [-60.0,-10.0,-30.0,45.0,-10.0,10.0]\n\
+                            3 PTP 20.0 [0.0,90.0,-90.0,0.0,0.0,0.0]\n\
+                        PROG_END";
+
+        RCLCPP_INFO(this->get_logger(), "Sending goal. . .");
         auto send_goal_options = rclcpp_action::Client<DbotTrajectory>::SendGoalOptions();
-        //send_goal_options.goal_response_callback = std::bind(&DbotTrajectoryActionClient::goal_response_callback, this, _1);
+        send_goal_options.goal_response_callback = std::bind(&DbotTrajectoryActionClient::goal_response_callback, this, _1);
         send_goal_options.feedback_callback = std::bind(&DbotTrajectoryActionClient::feedback_callback, this, _1, _2);
         send_goal_options.result_callback = std::bind(&DbotTrajectoryActionClient::result_callback, this, _1);
         this->action_client_->async_send_goal(goal_msg, send_goal_options);
+        RCLCPP_INFO(this->get_logger(), "Sending goal succeded. . .");
+        RCLCPP_INFO(this->get_logger(), "Waiting for feedback. . .");
     }
 
 private:
@@ -86,9 +99,11 @@ private:
      * 
      * @param future 
      */
-    void goal_response_callback(std::shared_future<GoalHandleDbotTrajectory::SharedPtr> future)
+    void goal_response_callback(const GoalHandleDbotTrajectory::SharedPtr& goal_handle)
     {
-        auto goal_handle = future.get();
+        // void goal_response_callback(std::shared_future<GoalHandleDbotTrajectory::SharedPtr> future)
+        // void goal_response_callback(const GoalHandleFibonacci::SharedPtr & goal_handle)
+        //auto goal_handle = future.get();
         if (!goal_handle) {
             RCLCPP_ERROR(this->get_logger(), "Goal was rejected by server");
         } else {
@@ -107,7 +122,8 @@ private:
         (void)ptr;
         std::stringstream ss;
         ss << "Feedback: \n";
-        for (size_t i = 0; i < (feedback->joints).size(); i++)
+        auto len = (feedback->joints).size();
+        for (size_t i = 0; i < len; i++)
         {
             ss << "Joint" << i << ": " << feedback->joints[i] << "\n";
         }
@@ -124,6 +140,7 @@ private:
         switch (result.code) 
         {
             case rclcpp_action::ResultCode::SUCCEEDED:
+                RCLCPP_INFO(this->get_logger(), "Goal succeded");
                 break;
             case rclcpp_action::ResultCode::ABORTED:
                 RCLCPP_ERROR(this->get_logger(), "Goal was aborted");
